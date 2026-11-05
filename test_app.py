@@ -1,14 +1,17 @@
 """Perchance Turnstile / key-mint test.
 
 Runs a real headless Chromium against the Perchance generator page on THIS
-container's own IP, watches the Turnstile gate, and — if a userKey is ever
-minted — immediately tests it server-side from this same container via the
-real generate API (POST image-generation.perchance.org/api/generate).
+container's own IP (or through the residential proxy in PROXY_URL when set),
+watches the Turnstile gate, and — if a userKey is ever minted — immediately
+tests it server-side from this same container/network via the real generate
+API (POST image-generation.perchance.org/api/generate).
 
-The result is served as JSON at GET /. NO key, cookie, or token material is
-ever written to disk or to the result: only booleans, counts, and (on
-success) the returned imageId, which is the proof that Perchance generation
-worked from this IP.
+Set PROXY_URL as a container env var (never in the repo) to route the
+browser AND the server-side test through a proxy, e.g. a residential proxy.
+The result is served as JSON at GET /. NO key, cookie, token or proxy
+credential is ever written to disk or to the result: only booleans, counts,
+and (on success) the returned imageId, which is the proof that Perchance
+generation worked from this IP.
 
 Endpoints:
   GET  /       -> latest test result JSON (or {"status": "not_run_yet"})
@@ -50,10 +53,28 @@ def _save(result):
         pass
 
 
+def _proxy_config():
+    """Return (httpx_proxy_url, playwright_proxy_dict) from PROXY_URL env,
+    or (None, None) when no proxy is configured. The URL itself is never
+    logged or put in any result."""
+    raw = (os.environ.get("PROXY_URL") or "").strip()
+    if not raw:
+        return None, None
+    u = urlparse(raw)
+    pw = {"server": f"{u.scheme}://{u.hostname}:{u.port}"}
+    if u.username:
+        pw["username"] = u.username
+    if u.password:
+        pw["password"] = u.password
+    return raw, pw
+
+
 def _container_ip_info():
     info = {}
+    proxy_url, _ = _proxy_config()
+    info["proxy_used"] = bool(proxy_url)
     try:
-        with httpx.Client(timeout=15) as c:
+        with httpx.Client(timeout=15, proxy=proxy_url) as c:
             info["ip"] = c.get("https://api.ipify.org").text.strip()
             r = c.get(f"http://ip-api.com/json/{info['ip']}?fields=status,org,as,isp")
             d = r.json()
@@ -84,7 +105,8 @@ def _server_side_generate(key):
         "guidanceScale": 7.0,
     }
     try:
-        with httpx.Client(timeout=120) as c:
+        proxy_url, _ = _proxy_config()
+        with httpx.Client(timeout=120, proxy=proxy_url) as c:
             r = c.post(url, json=body,
                        headers={"Content-Type": "text/plain;charset=UTF-8",
                                 "User-Agent": "Mozilla/5.0"})
@@ -139,11 +161,16 @@ def run_browser_test():
 
     try:
         with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True, args=[
+            _, pw_proxy = _proxy_config()
+            launch_kwargs = {"headless": True, "args": [
                 "--no-sandbox", "--disable-gpu", "--disable-dev-shm-usage",
                 "--single-process", "--disable-extensions",
                 "--disable-background-networking",
-            ])
+            ]}
+            if pw_proxy:
+                launch_kwargs["proxy"] = pw_proxy
+                note("browser using PROXY_URL (residential proxy)")
+            browser = p.chromium.launch(**launch_kwargs)
             page = browser.new_page(viewport={"width": 1280, "height": 800})
             page.on("request", on_request)
             note("navigating to generator page")
